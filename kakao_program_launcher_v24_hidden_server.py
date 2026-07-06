@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Kakao Local Program Launcher v26 - macOS only
+Kakao Local Program Launcher v27 - macOS only
 - Real desktop program UI, not web
 - Always asks access code on every program start
 - macOS-only launcher for GitHub Actions Mac build
@@ -11,6 +11,7 @@ Kakao Local Program Launcher v26 - macOS only
 - Bilingual UI/logs: Korean <-> Chinese
 - Stored log events re-render when language changes
 - Failure diagnostics are logged and can be copied from the UI
+- Per-profile KakaoTalk.app copy fallback for macOS multi-instance attempts
 - Standard library only
 """
 
@@ -21,6 +22,7 @@ import time
 import subprocess
 import threading
 import plistlib
+import shutil
 from pathlib import Path
 from urllib.request import Request, urlopen
 import tkinter as tk
@@ -44,6 +46,7 @@ def _api_url(path):
 
 APP_ICON_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAbElEQVR42u2XOw4AIAhDuf/5vA/uGo3C8zN06EbLU0iMZmb+WJ8BeDnXbJDdF52AmORuFdPNxztAQSzkpMwO+JGQjA8Ni9SzoYEb404WHBcz28TCxhes1dW3AGouAAEIQAACEIAAPvyaCeC2Kq8dufXUe6lPAAAAAElFTkSuQmCC"
 MAC_PROFILE_ROOT = Path.home() / "Library" / "Application Support" / "KakaoLocalLauncher" / "Profiles"
+MAC_APP_COPY_ROOT = Path.home() / "Library" / "Application Support" / "KakaoLocalLauncher" / "AppCopies"
 RUN_META = {}
 RUN_SEQ = 0
 
@@ -142,6 +145,22 @@ LOG_TEXTS = {
         "exe_missing": "실행 실패: 앱 번들 내부 실행 파일 없음",
         "profile_created": "Mac 독립 프로필 생성: {name}",
         "profile_create_error": "독립 프로필 생성 오류: {error}",
+        "app_copy_prepare": "프로필별 앱 복사 준비: {name}",
+        "app_copy_reuse": "프로필별 앱 복사본 재사용: {path}",
+        "app_copy_start": "프로필별 KakaoTalk.app 복사 시작: {path}",
+        "app_copy_done": "프로필별 KakaoTalk.app 복사 완료: {path}",
+        "app_copy_error": "프로필별 앱 복사 실패: {error}",
+        "app_copy_xattr": "프로필별 앱 보안 속성 정리 완료",
+        "app_copy_chmod": "프로필별 앱 실행 권한 확인 완료",
+        "strategy_clone_first": "다중 실행 감지: 복사 앱 우선 실행 방식 적용",
+        "strategy_original_first": "첫 실행 감지: 원본 앱 직접 실행 방식 적용",
+        "clone_direct_start": "복사 앱 직접 실행 시도: 프로필별 KakaoTalk.app",
+        "original_direct_start": "원본 앱 직접 실행 시도: /Applications/KakaoTalk.app",
+        "clone_open_start": "복사 앱 보조 실행 시도: open -n 프로필별 KakaoTalk.app",
+        "original_open_start": "원본 앱 보조 실행 시도: open -n /Applications/KakaoTalk.app",
+        "process_exit_early": "실행 직후 프로세스 종료 감지 / PID {pid} / exit={code}",
+        "attempt_after": "{method} 후 KakaoTalk 메인 프로세스 수: {count}",
+        "attempt_no_new": "{method} 결과: 새 메인 프로세스 증가 없음",
         "env_applied": "독립 실행 환경 적용 완료 / profile={profile}",
         "direct_start": "직접 실행 시도: KakaoTalk.app 내부 실행파일",
         "direct_pid": "직접 실행 요청 완료 / PID {pid}",
@@ -206,6 +225,22 @@ LOG_TEXTS = {
         "exe_missing": "启动失败：应用包内部没有可执行文件",
         "profile_created": "Mac 独立配置已创建：{name}",
         "profile_create_error": "独立配置创建错误：{error}",
+        "app_copy_prepare": "准备按配置复制应用：{name}",
+        "app_copy_reuse": "复用按配置复制的应用：{path}",
+        "app_copy_start": "开始复制按配置的 KakaoTalk.app：{path}",
+        "app_copy_done": "按配置复制 KakaoTalk.app 完成：{path}",
+        "app_copy_error": "按配置复制应用失败：{error}",
+        "app_copy_xattr": "按配置应用的安全属性已清理",
+        "app_copy_chmod": "按配置应用的执行权限已确认",
+        "strategy_clone_first": "检测到多开：优先使用复制应用启动方式",
+        "strategy_original_first": "检测到首次启动：使用原始应用直接启动方式",
+        "clone_direct_start": "复制应用直接启动尝试：按配置 KakaoTalk.app",
+        "original_direct_start": "原始应用直接启动尝试：/Applications/KakaoTalk.app",
+        "clone_open_start": "复制应用辅助启动尝试：open -n 按配置 KakaoTalk.app",
+        "original_open_start": "原始应用辅助启动尝试：open -n /Applications/KakaoTalk.app",
+        "process_exit_early": "检测到进程启动后立即退出 / PID {pid} / exit={code}",
+        "attempt_after": "{method} 后 KakaoTalk 主进程数量：{count}",
+        "attempt_no_new": "{method} 结果：没有新增主进程",
         "env_applied": "独立启动环境已应用 / profile={profile}",
         "direct_start": "直接启动尝试：KakaoTalk.app 内部可执行文件",
         "direct_pid": "直接启动请求完成 / PID {pid}",
@@ -508,6 +543,132 @@ def tail_file(path, max_chars=1200):
         return ""
 
 
+def mac_prepare_app_copy(original_app, profile_dir, logs):
+    """Create or reuse a per-profile copy of KakaoTalk.app.
+
+    Some macOS apps reuse an existing instance when launched from the same bundle path.
+    A copied bundle gives the second launch a different bundle path while preserving the original app contents.
+    The Info.plist is not modified, because editing it can invalidate the vendor signature.
+    """
+    profile_name = Path(profile_dir).name
+    append_log(logs, "app_copy_prepare", name=profile_name)
+    try:
+        MAC_APP_COPY_ROOT.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        append_log(logs, "app_copy_error", error=str(e))
+        return ""
+
+    dst = MAC_APP_COPY_ROOT / f"KakaoTalk_{profile_name}.app"
+    exe_probe = dst / "Contents" / "MacOS"
+    if dst.exists() and exe_probe.exists():
+        append_log(logs, "app_copy_reuse", path=str(dst))
+        return str(dst)
+
+    try:
+        if dst.exists():
+            shutil.rmtree(dst, ignore_errors=True)
+        append_log(logs, "app_copy_start", path=str(dst))
+        r = run_quiet(["ditto", str(original_app), str(dst)], timeout=180)
+        if getattr(r, "returncode", 1) != 0 or not dst.exists():
+            err = (getattr(r, "stderr", "") or getattr(r, "stdout", "") or "ditto failed").strip()
+            raise RuntimeError(err[:500])
+        append_log(logs, "app_copy_done", path=str(dst))
+    except Exception as e:
+        try:
+            if dst.exists():
+                shutil.rmtree(dst, ignore_errors=True)
+            shutil.copytree(str(original_app), str(dst), symlinks=True)
+            append_log(logs, "app_copy_done", path=str(dst))
+        except Exception as e2:
+            append_log(logs, "app_copy_error", error=str(e2 or e))
+            return ""
+
+    try:
+        run_quiet(["xattr", "-dr", "com.apple.quarantine", str(dst)], timeout=20)
+        append_log(logs, "app_copy_xattr")
+    except Exception:
+        pass
+
+    try:
+        macos_dir = dst / "Contents" / "MacOS"
+        for p in macos_dir.iterdir():
+            if p.is_file():
+                try:
+                    p.chmod(p.stat().st_mode | 0o111)
+                except Exception:
+                    pass
+        append_log(logs, "app_copy_chmod")
+    except Exception:
+        pass
+
+    return str(dst)
+
+
+def mac_check_launch_result(before, profile_dir, logs, method, stderr_path=None):
+    after = set(mac_list_main_pids())
+    append_log(logs, "attempt_after", method=method, count=len(after))
+    new_pids = sorted(after - before)
+    if new_pids:
+        for pid in new_pids:
+            register_pid(pid, "mac", str(profile_dir))
+        append_log(logs, "launch_success", count=len(after))
+        return True
+
+    append_log(logs, "attempt_no_new", method=method)
+    if stderr_path:
+        stderr_tail = tail_file(stderr_path)
+        if stderr_tail:
+            append_log(logs, "stderr_tail", text=stderr_tail)
+    return False
+
+
+def mac_try_direct_launch(start_key, exe, env, logs, stdout_path, stderr_path, before, profile_dir, method):
+    try:
+        append_log(logs, start_key)
+        out_f = open(stdout_path, "ab")
+        err_f = open(stderr_path, "ab")
+        try:
+            proc = subprocess.Popen(
+                [exe],
+                cwd=os.path.dirname(exe) or None,
+                env=env,
+                stdout=out_f,
+                stderr=err_f,
+                start_new_session=True,
+            )
+        finally:
+            out_f.close()
+            err_f.close()
+        append_log(logs, "direct_pid", pid=proc.pid)
+        time.sleep(0.7)
+        code = proc.poll()
+        if code is not None:
+            append_log(logs, "process_exit_early", pid=proc.pid, code=code)
+    except Exception as e:
+        append_log(logs, "direct_error", error=str(e))
+
+    time.sleep(2.8)
+    return mac_check_launch_result(before, profile_dir, logs, method, stderr_path)
+
+
+def mac_try_open_launch(start_key, app, env, logs, before, profile_dir, method):
+    try:
+        append_log(logs, start_key)
+        subprocess.Popen(
+            ["open", "-n", str(app)],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        append_log(logs, "open_requested")
+    except Exception as e:
+        append_log(logs, "open_error", error=str(e))
+
+    time.sleep(3.0)
+    return mac_check_launch_result(before, profile_dir, logs, method)
+
+
 def mac_launch(proxy=""):
     logs = []
     if not is_mac():
@@ -524,11 +685,6 @@ def mac_launch(proxy=""):
         append_log(logs, "copy_required")
         return False, logs
 
-    exe = mac_app_executable(app, logs)
-    if not exe:
-        append_log(logs, "copy_required")
-        return False, logs
-
     profile_dir = mac_profile_dir_for_next_instance(logs)
     env = mac_launch_env(profile_dir, proxy)
     append_log(logs, "env_applied", profile=str(profile_dir))
@@ -536,62 +692,69 @@ def mac_launch(proxy=""):
     stdout_path = Path(profile_dir) / "launcher_stdout.log"
     stderr_path = Path(profile_dir) / "launcher_stderr.log"
 
-    try:
-        append_log(logs, "direct_start")
-        out_f = open(stdout_path, "ab")
-        err_f = open(stderr_path, "ab")
-        try:
-            proc = subprocess.Popen(
-                [exe],
-                cwd=os.path.dirname(exe) or None,
-                env=env,
-                stdout=out_f,
-                stderr=err_f,
-                start_new_session=True,
-            )
-        finally:
-            out_f.close()
-            err_f.close()
-        append_log(logs, "direct_pid", pid=proc.pid)
-    except Exception as e:
-        append_log(logs, "direct_error", error=str(e))
+    # For the second and later launch, try a copied app bundle first.
+    # This separates the bundle path as well as HOME/TMPDIR.
+    if before:
+        append_log(logs, "strategy_clone_first")
+        clone_app = mac_prepare_app_copy(app, profile_dir, logs)
+        if clone_app:
+            clone_exe = mac_app_executable(clone_app, logs)
+            if clone_exe:
+                if mac_try_direct_launch(
+                    "clone_direct_start",
+                    clone_exe,
+                    env,
+                    logs,
+                    stdout_path,
+                    stderr_path,
+                    before,
+                    profile_dir,
+                    "복사 앱 직접 실행",
+                ):
+                    return True, logs
+                if mac_try_open_launch(
+                    "clone_open_start",
+                    clone_app,
+                    env,
+                    logs,
+                    before,
+                    profile_dir,
+                    "복사 앱 open -n",
+                ):
+                    return True, logs
+            else:
+                append_log(logs, "exe_missing")
+    else:
+        append_log(logs, "strategy_original_first")
 
-    time.sleep(2.8)
-    after_direct = set(mac_list_main_pids())
-    append_log(logs, "direct_after", count=len(after_direct))
-    new_pids = sorted(after_direct - before)
-    if new_pids:
-        for pid in new_pids:
-            register_pid(pid, "mac", str(profile_dir))
-        append_log(logs, "launch_success", count=len(after_direct))
+    # Fallback to the original app bundle.
+    exe = mac_app_executable(app, logs)
+    if not exe:
+        append_log(logs, "copy_required")
+        return False, logs
+
+    if mac_try_direct_launch(
+        "original_direct_start",
+        exe,
+        env,
+        logs,
+        stdout_path,
+        stderr_path,
+        before,
+        profile_dir,
+        "원본 앱 직접 실행",
+    ):
         return True, logs
 
-    append_log(logs, "direct_no_new")
-    stderr_tail = tail_file(stderr_path)
-    if stderr_tail:
-        append_log(logs, "stderr_tail", text=stderr_tail)
-
-    try:
-        append_log(logs, "open_start")
-        subprocess.Popen(
-            ["open", "-n", app],
-            env=env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-        append_log(logs, "open_requested")
-    except Exception as e:
-        append_log(logs, "open_error", error=str(e))
-
-    time.sleep(2.8)
-    after_open = set(mac_list_main_pids())
-    append_log(logs, "open_after", count=len(after_open))
-    new_pids = sorted(after_open - before)
-    if new_pids:
-        for pid in new_pids:
-            register_pid(pid, "mac", str(profile_dir))
-        append_log(logs, "launch_success", count=len(after_open))
+    if mac_try_open_launch(
+        "original_open_start",
+        app,
+        env,
+        logs,
+        before,
+        profile_dir,
+        "원본 앱 open -n",
+    ):
         return True, logs
 
     append_log(logs, "launch_fail_no_new")
