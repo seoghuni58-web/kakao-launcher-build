@@ -4,8 +4,8 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-mac:
-    runs-on: macos-latest
+  build-mac-intel:
+    runs-on: macos-15-intel
 
     steps:
       - name: Checkout
@@ -15,15 +15,22 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          architecture: "x64"
 
       - name: Install PyInstaller
         run: |
           python3 -m pip install --upgrade pip
           python3 -m pip install pyinstaller
 
-      - name: Build Mac App
+      - name: Build Mac App Intel
         run: |
           python3 -m PyInstaller --windowed --name KakaoLauncher kakao_program_launcher_v24_hidden_server.py
+
+      - name: Fix Permissions And Sign
+        run: |
+          chmod +x "dist/KakaoLauncher.app/Contents/MacOS/KakaoLauncher"
+          xattr -cr "dist/KakaoLauncher.app"
+          codesign --force --deep --sign - "dist/KakaoLauncher.app"
 
       - name: Zip App
         run: |
@@ -33,5 +40,5 @@ jobs:
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: KakaoLauncherMac
+          name: KakaoLauncherMac-Intel
           path: dist/KakaoLauncherMac.zip
