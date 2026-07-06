@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
+# V28_REAL_CONFIRMED_BY_CHATGPT_DO_NOT_USE_OLD_V27
 """
-Kakao Local Program Launcher v27 - macOS only
+Kakao Local Program Launcher v28 - macOS only
 - Real desktop program UI, not web
 - Always asks access code on every program start
 - macOS-only launcher for GitHub Actions Mac build
@@ -12,6 +13,7 @@ Kakao Local Program Launcher v27 - macOS only
 - Stored log events re-render when language changes
 - Failure diagnostics are logged and can be copied from the UI
 - Per-profile KakaoTalk.app copy fallback for macOS multi-instance attempts
+- v28: bundle-id/display-name split, ad-hoc codesign, LaunchServices re-register for copied apps
 - Standard library only
 """
 
@@ -152,6 +154,16 @@ LOG_TEXTS = {
         "app_copy_error": "프로필별 앱 복사 실패: {error}",
         "app_copy_xattr": "프로필별 앱 보안 속성 정리 완료",
         "app_copy_chmod": "프로필별 앱 실행 권한 확인 완료",
+        "bundle_split_start": "복사 앱 번들 정보 분리 시작: {profile}",
+        "bundle_split_done": "복사 앱 번들 정보 분리 완료: {bundle_id}",
+        "bundle_split_error": "복사 앱 번들 정보 분리 오류: {error}",
+        "bundle_url_clean": "복사 앱 URL 스킴 정리 완료",
+        "codesign_start": "복사 앱 임시 서명 시도",
+        "codesign_done": "복사 앱 임시 서명 완료",
+        "codesign_error": "복사 앱 임시 서명 실패: {error}",
+        "lsregister_start": "복사 앱 LaunchServices 등록 시도",
+        "lsregister_done": "복사 앱 LaunchServices 등록 완료",
+        "lsregister_error": "복사 앱 LaunchServices 등록 실패: {error}",
         "strategy_clone_first": "다중 실행 감지: 복사 앱 우선 실행 방식 적용",
         "strategy_original_first": "첫 실행 감지: 원본 앱 직접 실행 방식 적용",
         "clone_direct_start": "복사 앱 직접 실행 시도: 프로필별 KakaoTalk.app",
@@ -232,6 +244,16 @@ LOG_TEXTS = {
         "app_copy_error": "按配置复制应用失败：{error}",
         "app_copy_xattr": "按配置应用的安全属性已清理",
         "app_copy_chmod": "按配置应用的执行权限已确认",
+        "bundle_split_start": "复制应用包信息分离开始：{profile}",
+        "bundle_split_done": "复制应用包信息分离完成：{bundle_id}",
+        "bundle_split_error": "复制应用包信息分离错误：{error}",
+        "bundle_url_clean": "复制应用 URL Scheme 已整理",
+        "codesign_start": "复制应用临时签名尝试",
+        "codesign_done": "复制应用临时签名完成",
+        "codesign_error": "复制应用临时签名失败：{error}",
+        "lsregister_start": "复制应用 LaunchServices 注册尝试",
+        "lsregister_done": "复制应用 LaunchServices 注册完成",
+        "lsregister_error": "复制应用 LaunchServices 注册失败：{error}",
         "strategy_clone_first": "检测到多开：优先使用复制应用启动方式",
         "strategy_original_first": "检测到首次启动：使用原始应用直接启动方式",
         "clone_direct_start": "复制应用直接启动尝试：按配置 KakaoTalk.app",
@@ -544,13 +566,13 @@ def tail_file(path, max_chars=1200):
 
 
 def mac_prepare_app_copy(original_app, profile_dir, logs):
-    """Create or reuse a per-profile copy of KakaoTalk.app.
+    """Create a per-profile KakaoTalk.app copy and make it look like a separate app.
 
-    Some macOS apps reuse an existing instance when launched from the same bundle path.
-    A copied bundle gives the second launch a different bundle path while preserving the original app contents.
-    The Info.plist is not modified, because editing it can invalidate the vendor signature.
+    v28 intentionally does not reuse old copied bundles. Old copies may still contain the
+    original bundle id and will not exercise the bundle-id split/codesign path.
     """
     profile_name = Path(profile_dir).name
+    safe_profile = profile_name.replace("-", "_").replace(".", "_")
     append_log(logs, "app_copy_prepare", name=profile_name)
     try:
         MAC_APP_COPY_ROOT.mkdir(parents=True, exist_ok=True)
@@ -558,11 +580,7 @@ def mac_prepare_app_copy(original_app, profile_dir, logs):
         append_log(logs, "app_copy_error", error=str(e))
         return ""
 
-    dst = MAC_APP_COPY_ROOT / f"KakaoTalk_{profile_name}.app"
-    exe_probe = dst / "Contents" / "MacOS"
-    if dst.exists() and exe_probe.exists():
-        append_log(logs, "app_copy_reuse", path=str(dst))
-        return str(dst)
+    dst = MAC_APP_COPY_ROOT / f"KakaoTalk_{safe_profile}.app"
 
     try:
         if dst.exists():
@@ -583,12 +601,48 @@ def mac_prepare_app_copy(original_app, profile_dir, logs):
             append_log(logs, "app_copy_error", error=str(e2 or e))
             return ""
 
+    # Remove quarantine on the copied bundle.
     try:
         run_quiet(["xattr", "-dr", "com.apple.quarantine", str(dst)], timeout=20)
         append_log(logs, "app_copy_xattr")
     except Exception:
         pass
 
+    # v28: split bundle identity/display names so LaunchServices sees a distinct app.
+    try:
+        append_log(logs, "bundle_split_start", profile=profile_name)
+        plist_path = dst / "Contents" / "Info.plist"
+        with plist_path.open("rb") as f:
+            info = plistlib.load(f)
+
+        original_bundle_id = str(info.get("CFBundleIdentifier") or "com.kakao.KakaoTalk")
+        new_bundle_id = f"{original_bundle_id}.launcher.{safe_profile}"
+        new_name = f"KakaoTalk_{safe_profile}"
+
+        info["CFBundleIdentifier"] = new_bundle_id
+        info["CFBundleName"] = new_name
+        info["CFBundleDisplayName"] = new_name
+        info["LSMultipleInstancesProhibited"] = False
+        info["NSPrincipalClass"] = info.get("NSPrincipalClass", "NSApplication")
+
+        # URL scheme collisions can make macOS route to the first registered KakaoTalk.
+        # Keep the array valid but de-conflict any scheme names in the copy.
+        if isinstance(info.get("CFBundleURLTypes"), list):
+            for idx, item in enumerate(info["CFBundleURLTypes"]):
+                if isinstance(item, dict):
+                    item["CFBundleURLName"] = f"{new_bundle_id}.url.{idx}"
+                    schemes = item.get("CFBundleURLSchemes")
+                    if isinstance(schemes, list):
+                        item["CFBundleURLSchemes"] = [f"{str(x)}-{safe_profile}" for x in schemes]
+            append_log(logs, "bundle_url_clean")
+
+        with plist_path.open("wb") as f:
+            plistlib.dump(info, f, sort_keys=False)
+        append_log(logs, "bundle_split_done", bundle_id=new_bundle_id)
+    except Exception as e:
+        append_log(logs, "bundle_split_error", error=str(e))
+
+    # Ensure executable bits are present.
     try:
         macos_dir = dst / "Contents" / "MacOS"
         for p in macos_dir.iterdir():
@@ -601,8 +655,32 @@ def mac_prepare_app_copy(original_app, profile_dir, logs):
     except Exception:
         pass
 
-    return str(dst)
+    # v28: after modifying Info.plist, the vendor signature is invalid. Ad-hoc sign the copy.
+    try:
+        append_log(logs, "codesign_start")
+        r = run_quiet(["codesign", "--force", "--deep", "--sign", "-", str(dst)], timeout=120)
+        if getattr(r, "returncode", 1) == 0:
+            append_log(logs, "codesign_done")
+        else:
+            err = (getattr(r, "stderr", "") or getattr(r, "stdout", "") or "codesign failed").strip()
+            append_log(logs, "codesign_error", error=err[:500])
+    except Exception as e:
+        append_log(logs, "codesign_error", error=str(e))
 
+    # v28: explicitly register the copied app with LaunchServices.
+    try:
+        append_log(logs, "lsregister_start")
+        lsregister = "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+        r = run_quiet([lsregister, "-f", str(dst)], timeout=30)
+        if getattr(r, "returncode", 1) == 0:
+            append_log(logs, "lsregister_done")
+        else:
+            err = (getattr(r, "stderr", "") or getattr(r, "stdout", "") or "lsregister failed").strip()
+            append_log(logs, "lsregister_error", error=err[:500])
+    except Exception as e:
+        append_log(logs, "lsregister_error", error=str(e))
+
+    return str(dst)
 
 def mac_check_launch_result(before, profile_dir, logs, method, stderr_path=None):
     after = set(mac_list_main_pids())
